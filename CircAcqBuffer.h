@@ -46,6 +46,8 @@ protected:
 	
 	inline void _lock_out(unsigned int n)
 	{
+		locked.store(n);  // Update locked out value
+
 		// Pointer swap
 		CircAcqElement<T>* tmp = locked_out_buffer;
 		locked_out_buffer = ring[n];
@@ -97,9 +99,7 @@ public:
 			int requested = mod2(n, ring_size);  // Get index of buffer where requested element is/was
 			if (!locks[requested].try_lock())  // Can't lock out/push to same element from two threads at once
 			{
-				locked.store(-2);  // Two consumers is undefined but this is a bandaid of sorts if you try it
 				_lock_out(requested);
-				locked.store(requested);  // Update locked out value
 				locks[requested].release();  // Exit critical section
 				*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
 				return locked_out_buffer->count;  // Return n-th buffer you actually got
@@ -116,7 +116,6 @@ public:
 		while (locked.load() != -1);  // Only one buffer can be locked out at a time
 		int requested = mod2(n, ring_size);
 		while (!locks[requested].try_lock());
-		locked.store(-2);  // Bad way to protect this critical section
 		_lock_out(requested);
 		locks[requested].unlock();  // Exit critical section
 		*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
@@ -140,7 +139,7 @@ public:
 		return oldhead;
 	}
 
-	// Unsafe interface for caller to copy into buffer head directly
+	// Interface for caller to copy into buffer head directly
 	T* lock_out_head()
 	{
 		while (!locks[head].try_lock());
@@ -154,7 +153,6 @@ public:
 		int oldhead = head;
 		head = mod2(head + 1, ring_size);
 		locks[oldhead].unlock();
-		printf("Head is now -> %i and count is %i\n", head, count);
 		return oldhead;
 	}
 
@@ -165,10 +163,10 @@ public:
 
 	void clear()
 	{
-		// Reset the buffer to its initial state with a count of 0
+		// Reset the buffer to its initial state with a count of 0. Not thread safe
 		for (int i = 0; i < ring_size; i++)
 		{
-			while (!locks[i].try_lock());  // prone to deadlock
+			while (!locks[i].try_lock());
 			ring[i]->index = i;
 			ring[i]->count = -1;
 			locks[i].unlock();
@@ -178,7 +176,6 @@ public:
 		locked.store(-1);
 		locked_out_buffer->index = -1;
 		locked_out_buffer->count = -1;
-
 	}
 
 	~CircAcqBuffer()
