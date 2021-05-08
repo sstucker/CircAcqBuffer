@@ -53,8 +53,6 @@ protected:
 		locked_out_buffer = ring[n];
 		ring[n] = tmp;
 
-		printf("Locked out %i and put what used to be %i back into ring in its place\n", n, ring[n]->index);
-
 		// Update index to buffer's new position in ring
 		ring[n]->index = n;
 	}
@@ -118,7 +116,6 @@ public:
 		while (locked.load() != -1);  // Only one buffer can be locked out at a time
 		int got = -1;
 		int requested = mod2(n, ring_size);
-		printf("Expecting to find %i in index %i\n", n, requested);
 		while (n > ring[requested]->count.load() || ring[requested]->count.load() == -1);  // Spinlock if buffer n-th buffer hasn't been pushed yet. You might wait forever!
 		while (!locks[requested].try_lock());
 		_lock_out(requested);
