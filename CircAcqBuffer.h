@@ -7,7 +7,8 @@
 // pushed to the ring are given a count corresponding to the number of times push() has been called
 // since the buffer was initialized. A push() constitutes a copy into buffer-managed memory. The n-th element
 // can be locked out of the ring for processing, copy or display and then subsequently released. If the n-th
-// element isn't available yet or has been overwritten, the buffer where the n-th element would have been
+// element isn't available yet, lock_out_nowait() function returns -1 and lock_out_wait() spinlocks until the requested
+// count is available. If the n-th element has been overwritten, the buffer where the n-th element would have been
 // is returned instead along with the count of the element you have actually locked out. Somewhat thread-safe but
 // only designed for single-producer single-consumer use.
 //
@@ -25,7 +26,7 @@ struct CircAcqElement
 {
 	T* arr;  // the buffer
 	unsigned int index;  // position of data in ring 
-	long count;  // the count of the data currently in the buffer
+	std::atomic_int count;  // the count of the data currently in the buffer
 };
 
 
@@ -39,7 +40,7 @@ protected:
 	unsigned int ring_size;
 	unsigned int element_size;
 	int head;
-	long count;  // cumulative count
+	std::atomic_long count;  // cumulative count
 	std::mutex* locks;  // Locks on each ring pointer
 	std::atomic_int locked;  // index of currently locked buffer
 	
@@ -50,7 +51,9 @@ protected:
 		// Pointer swap
 		CircAcqElement<T>* tmp = locked_out_buffer;
 		locked_out_buffer = ring[n];
-		ring[n] = locked_out_buffer;
+		ring[n] = tmp;
+
+		printf("Locked out %i and put what used to be %i back into ring in its place\n", n, ring[n]->index);
 
 		// Update index to buffer's new position in ring
 		ring[n]->index = n;
@@ -84,7 +87,7 @@ public:
 		locked_out_buffer->arr = new T[element_size];
 		locked_out_buffer->index = -1;
 		locked_out_buffer->count = -1;
-		count = 0;
+		count.store(-1);
 	}
 
 	long lock_out_nowait(unsigned int n, T** buffer)
@@ -101,7 +104,7 @@ public:
 				_lock_out(requested);
 				locks[requested].release();  // Exit critical section
 				*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
-				return locked_out_buffer->count;  // Return n-th buffer you actually got
+				return locked_out_buffer->count.load();  // Return n-th buffer you actually got
 			}
 			else
 			{
@@ -113,12 +116,16 @@ public:
 	long lock_out_wait(unsigned int n, T** buffer)
 	{
 		while (locked.load() != -1);  // Only one buffer can be locked out at a time
+		int got = -1;
 		int requested = mod2(n, ring_size);
+		printf("Expecting to find %i in index %i\n", n, requested);
+		while (n > ring[requested]->count.load() || ring[requested]->count.load() == -1);  // Spinlock if buffer n-th buffer hasn't been pushed yet. You might wait forever!
 		while (!locks[requested].try_lock());
 		_lock_out(requested);
+		fflush(stdout);
 		locks[requested].unlock();  // Exit critical section
 		*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
-		return locked_out_buffer->count;  // Return n-th buffer you actually got
+		return locked_out_buffer->count.load();  // Return n-th buffer you actually got
 	}
 
 	void release()
@@ -131,7 +138,7 @@ public:
 		while (!locks[head].try_lock());  // prone to deadlock
 		memcpy(ring[head]->arr, src, sizeof(T) * element_size);
 		count += 1;
-		ring[head]->count = count;
+		ring[head]->count.store(count);
 		int oldhead = head;
 		head = mod2(head + 1, ring_size);
 		locks[oldhead].unlock();
@@ -155,9 +162,9 @@ public:
 		return oldhead;
 	}
 
-	int get_latest_index()
+	int get_count()
 	{
-		return count;
+		return count.load();
 	}
 
 	void clear()
