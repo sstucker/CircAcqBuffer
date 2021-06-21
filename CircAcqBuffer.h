@@ -25,8 +25,8 @@ template <typename T>
 struct CircAcqElement
 {
 	T* arr;  // the buffer
-	unsigned int index;  // position of data in ring 
-	std::atomic_int count;  // the count of the data currently in the buffer
+	int index;  // position of data in ring 
+	std::atomic_int count;  // the count of the data currently in the buffer. Needs to be atomic as it is polled from outside the lock
 };
 
 
@@ -37,14 +37,14 @@ protected:
 
 	CircAcqElement<T>** ring;
 	CircAcqElement<T>* locked_out_buffer;
-	unsigned int ring_size;
-	unsigned int element_size;
+	int ring_size;
+	long element_size;
 	int head;
 	std::atomic_long count;  // cumulative count
 	std::mutex* locks;  // Locks on each ring pointer
 	std::atomic_int locked;  // index of currently locked buffer
 	
-	inline void _lock_out(unsigned int n)
+	inline void _lock_out(int n)
 	{
 		locked.store(n);  // Update locked out value
 
@@ -65,12 +65,14 @@ public:
 		element_size = 0;
 	}
 
-	CircAcqBuffer(int number_of_buffers, int frame_size)
+	const T* operator [](int i) const { return ring[mod2(i, ring_size)]->arr; }
+
+	CircAcqBuffer(int number_of_buffers, long frame_size)
 	{
 		ring_size = number_of_buffers;
 		element_size = frame_size;
 		head = 0;
-		locked.store(-1);
+		locked = ATOMIC_VAR_INIT(-1);
 		ring = new CircAcqElement<T>*[ring_size];
 		locks = new std::mutex[ring_size];
 		for (int i = 0; i < ring_size; i++)
@@ -85,10 +87,10 @@ public:
 		locked_out_buffer->arr = new T[element_size];
 		locked_out_buffer->index = -1;
 		locked_out_buffer->count = -1;
-		count.store(-1);
+		count = ATOMIC_VAR_INIT(-1);
 	}
 
-	long lock_out_nowait(unsigned int n, T** buffer)
+	long lock_out_nowait(int n, T** buffer)
 	{
 		if (locked.load() != -1)  // Only one buffer can be locked out at a time
 		{
@@ -100,7 +102,7 @@ public:
 			if (!locks[requested].try_lock())  // Can't lock out/push to same element from two threads at once
 			{
 				_lock_out(requested);
-				locks[requested].release();  // Exit critical section
+				locks[requested].unlock();  // Exit critical section
 				*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
 				return locked_out_buffer->count.load();  // Return n-th buffer you actually got
 			}
@@ -111,7 +113,7 @@ public:
 		}
 	}
 
-	long lock_out_wait(unsigned int n, T** buffer)
+	long lock_out_wait(int n, T** buffer)
 	{
 		while (locked.load() != -1);  // Only one buffer can be locked out at a time
 		int got = -1;
@@ -134,11 +136,11 @@ public:
 	{
 		while (!locks[head].try_lock());  // prone to deadlock
 		memcpy(ring[head]->arr, src, sizeof(T) * element_size);
-		count += 1;
 		ring[head]->count.store(count);
 		int oldhead = head;
 		head = mod2(head + 1, ring_size);
 		locks[oldhead].unlock();
+		count += 1;
 		return oldhead;
 	}
 
