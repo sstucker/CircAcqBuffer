@@ -121,7 +121,6 @@ public:
 		while (n > ring[requested]->count.load() || ring[requested]->count.load() == -1);  // Spinlock if buffer n-th buffer hasn't been pushed yet. You might wait forever!
 		while (!locks[requested].try_lock());
 		_lock_out(requested);
-		fflush(stdout);
 		locks[requested].unlock();  // Exit critical section
 		*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
 		return locked_out_buffer->count.load();  // Return n-th buffer you actually got
