@@ -2,18 +2,29 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <deque>
+#include <chrono>
 
-// Push-only ring buffer inspired by buffer interface of National Instruments IMAQ software. Elements
-// pushed to the ring are given a count corresponding to the number of times push() has been called
-// since the buffer was initialized. A push() constitutes a copy into buffer-managed memory. The n-th element
-// can be locked out of the ring for processing, copy or display and then subsequently released. If the n-th
-// element isn't available yet, lock_out_nowait() function returns -1 and lock_out_wait() spinlocks until the requested
-// count is available. If the n-th element has been overwritten, the buffer where the n-th element would have been
-// is returned instead along with the count of the element you have actually locked out. Somewhat thread-safe but
-// only designed for single-producer single-consumer use.
-//
-// sstucker 2021
-//
+/*
+Push-only ring buffer inspired by ring buffer interface of National Instruments IMAQ software.
+
+Elements pushed to the ring are given a count corresponding to the number of times push() has been called 
+since the buffer was initialized. A push() constitutes a copy into buffer-managed memory.
+
+Any n-th element can be locked out of the ring for processing, copy or display and then subsequently released.
+
+If the n-th element isn't available yet, is already locked out, or is being accessed by another thread,
+lock_out() returns -1 after timing out.
+
+If the n-th element has been overwritten, the buffer where the n-th element would have been
+is returned instead along with the count of the element you have actually locked out.
+
+github.com/sstucker
+2021
+*/
+
+typedef std::chrono::high_resolution_clock clk;
+typedef std::chrono::microseconds us;
 
 inline int mod2(int a, int b)
 {
@@ -38,13 +49,13 @@ protected:
 	CircAcqElement<T>** ring;
 	CircAcqElement<T>* locked_out_buffer;
 	int ring_size;
-	long element_size;
-	int head;
+	uint64_t element_size;
 	std::atomic_long count;  // cumulative count
-	std::mutex* locks;  // Locks on each ring pointer
-	std::atomic_int locked;  // index of currently locked buffer
-	
-	inline void _lock_out(int n)
+	std::atomic_int locked;  // index of currently locked out buffer
+	std::atomic_int head;  // Head of buffer (receives push)
+	std::deque<std::mutex> locks;
+
+	inline void _swap(int n)
 	{
 		locked.store(n);  // Update locked out value
 
@@ -57,24 +68,59 @@ protected:
 		ring[n]->index = n;
 	}
 
+	inline long _lock_out(int n, T** buffer, int timeout_ms)
+	{
+		auto start = clk::now();  // Start timeout timer
+		int timeout_us = timeout_ms * 1000;  // Compare using integer microseconds
+		while (locked.load() != -1)
+		{
+			if (std::chrono::duration_cast<us>(clk::now() - start).count() > timeout_us)
+			{
+				printf("CircAcqBuffer: Timed out waiting for locked out buffer to be released.\n");
+				return -1;
+			}
+		}
+		int requested = mod2(n, ring_size);  // Get index of buffer where requested element is/was
+		while (n > ring[requested]->count.load())
+		{
+			if (std::chrono::duration_cast<us>(clk::now() - start).count() > timeout_us)
+			{
+				printf("CircAcqBuffer: Timed out trying to acquire %i for %i ms.\n", n, timeout_ms);
+				return -1;
+			}
+		}
+		while (!locks[requested].try_lock())
+		{
+			if (std::chrono::duration_cast<us>(clk::now() - start).count() > timeout_us)
+			{
+				printf("CircAcqBuffer: Timed out trying to unlock buffer %i for %i ms.\n", requested, timeout_ms);
+				return -1;
+			}
+		}
+		_swap(requested);
+		*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array by reference
+		auto locked_out = locked_out_buffer->count.load();  // Return true count of the locked out buffer
+		locks[requested].unlock();
+		return locked_out;
+	}
+
 public:
 
 	CircAcqBuffer()
 	{
 		ring_size = 0;
 		element_size = 0;
+		head = ATOMIC_VAR_INIT(0);
 	}
 
-	const T* operator [](int i) const { return ring[mod2(i, ring_size)]->arr; }
-
-	CircAcqBuffer(int number_of_buffers, long frame_size)
+	CircAcqBuffer(int number_of_buffers, uint64_t frame_size)
 	{
 		ring_size = number_of_buffers;
 		element_size = frame_size;
-		head = 0;
+		head = ATOMIC_VAR_INIT(0);
 		locked = ATOMIC_VAR_INIT(-1);
 		ring = new CircAcqElement<T>*[ring_size];
-		locks = new std::mutex[ring_size];
+		locks.resize(ring_size);
 		for (int i = 0; i < ring_size; i++)
 		{
 			ring[i] = new(CircAcqElement<T>);
@@ -82,7 +128,7 @@ public:
 			ring[i]->index = i;
 			ring[i]->count = -1;
 		}
-		// locked_out_buffer maps to actual storage swapped in to replace a buffer when it is locked out
+		// locked_out_buffer maps to memory swapped in to replace a buffer when it is locked out
 		locked_out_buffer = new(CircAcqElement<T>);
 		locked_out_buffer->arr = new T[element_size];
 		locked_out_buffer->index = -1;
@@ -90,40 +136,14 @@ public:
 		count = ATOMIC_VAR_INIT(-1);
 	}
 
-	long lock_out_nowait(int n, T** buffer)
+	long lock_out(int n, T** buffer, int timeout_ms)
 	{
-		if (locked.load() != -1)  // Only one buffer can be locked out at a time
-		{
-			return -1;
-		}
-		else
-		{
-			int requested = mod2(n, ring_size);  // Get index of buffer where requested element is/was
-			if (!locks[requested].try_lock())  // Can't lock out/push to same element from two threads at once
-			{
-				_lock_out(requested);
-				locks[requested].unlock();  // Exit critical section
-				*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
-				return locked_out_buffer->count.load();  // Return n-th buffer you actually got
-			}
-			else
-			{
-				return -1;
-			}
-		}
+		return _lock_out(n, buffer, timeout_ms);
 	}
 
-	long lock_out_wait(int n, T** buffer)
+	long lock_out(int n, T** buffer)
 	{
-		while (locked.load() != -1);  // Only one buffer can be locked out at a time
-		int got = -1;
-		int requested = mod2(n, ring_size);
-		while (n > ring[requested]->count.load() || ring[requested]->count.load() == -1);  // Spinlock if buffer n-th buffer hasn't been pushed yet. You might wait forever!
-		while (!locks[requested].try_lock());
-		_lock_out(requested);
-		locks[requested].unlock();  // Exit critical section
-		*buffer = locked_out_buffer->arr;  // Return pointer to locked out buffer's array
-		return locked_out_buffer->count.load();  // Return n-th buffer you actually got
+		return _lock_out(n, buffer, 0);
 	}
 
 	void release()
@@ -133,20 +153,19 @@ public:
 
 	int push(T* src)
 	{
-		while (!locks[head].try_lock());  // prone to deadlock
+		int oldhead = head;
+		locks[head].lock();
 		memcpy(ring[head]->arr, src, sizeof(T) * element_size);
 		ring[head]->count.store(count);
-		int oldhead = head;
 		head = mod2(head + 1, ring_size);
-		locks[oldhead].unlock();
 		count += 1;
+		locks[oldhead].unlock();
 		return oldhead;
 	}
 
-	// Interface for caller to copy into buffer head directly
 	T* lock_out_head()
 	{
-		while (!locks[head].try_lock());
+		locks[head].lock();
 		return ring[head]->arr;
 	}
 
@@ -167,16 +186,15 @@ public:
 
 	void clear()
 	{
-		// Reset the buffer to its initial state with a count of 0. Not thread safe
 		for (int i = 0; i < ring_size; i++)
 		{
-			while (!locks[i].try_lock());
+			locks[i].lock();
 			ring[i]->index = i;
 			ring[i]->count = -1;
 			locks[i].unlock();
 		}
-		count = 0;
-		head = 0;
+		count.store(-1);
+		head.store(0);
 		locked.store(-1);
 		locked_out_buffer->index = -1;
 		locked_out_buffer->count = -1;
@@ -189,7 +207,6 @@ public:
 			delete[] ring[i]->arr;
 		}
 		delete[] ring;
-		delete[] locks;
 		delete locked_out_buffer;
 	}
 
