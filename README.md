@@ -4,10 +4,9 @@ Only tested with MSVC.
 
 Push-only ring buffer inspired by ring buffer interface of National Instruments IMAQ software.
 
-Elements pushed to the ring are given a count corresponding to the number of times push() has been called .
+Elements `push`ed to the ring are given a count.
 
-since the buffer was initialized. A push() constitutes a copy into buffer-managed memory.
-Any n-th element can be locked out of the ring for processing, copy or display and then subsequently released.
+A `push` is a copy into buffer-managed memory. Any n-th element can be locked out of the ring for processing, copy or display and then subsequently released.
 
 If the n-th element isn't available yet, is already locked out, or is being accessed by another thread, lock_out() returns -1 after timing out.
 
